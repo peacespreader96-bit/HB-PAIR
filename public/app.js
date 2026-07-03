@@ -132,7 +132,7 @@ function startPolling() {
       }
 
       if (status === 'ready') {
-        setStatus('ready', 'Session is ready. Download the ZIP now.');
+        setStatus('ready', 'Fully synced! Your creds.json is ready.');
         downloadBtn.hidden = false;
         stopPolling();
         return;
