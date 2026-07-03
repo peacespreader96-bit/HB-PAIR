@@ -7,6 +7,7 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import helmet from 'helmet';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -17,6 +18,9 @@ const __dirname = path.dirname(__filename);
 const SESSION_PATH = process.env.SESSION_PATH || path.join(__dirname, 'session');
 const PUBLIC_PATH = path.join(__dirname, 'public');
 const PORT = process.env.PORT || 3000;
+const MAX_RECONNECT_ATTEMPTS = 6;
+const SYNC_WARNING_MS = 45_000;
+const LOGIN_TIMEOUT_MS = 180_000;
 
 const app = express();
 
@@ -44,10 +48,38 @@ app.use(
 );
 
 // ── STATE ────────────────────────────────────────────────────────────────
-let current = { status: 'idle', code: null, sock: null, error: null, syncTimer: null };
+let current = freshState();
+
+function freshState() {
+  return {
+    sessionId: null,
+    status: 'idle',
+    code: null,
+    sock: null,
+    error: null,
+    detail: null,
+    syncTimer: null,
+    hardTimer: null,
+    reconnectTimer: null,
+    pairingCodeTimer: null,
+    reconnectAttempts: 0,
+  };
+}
 
 function ensureSessionDirectory() {
   fs.mkdirSync(SESSION_PATH, { recursive: true });
+}
+
+function clearTimer(name) {
+  if (current[name]) clearTimeout(current[name]);
+  current[name] = null;
+}
+
+function clearAllTimers() {
+  clearTimer('syncTimer');
+  clearTimer('hardTimer');
+  clearTimer('reconnectTimer');
+  clearTimer('pairingCodeTimer');
 }
 
 function safeCloseSocket(sock) {
@@ -60,9 +92,9 @@ function safeCloseSocket(sock) {
 }
 
 function clearSession() {
-  if (current.syncTimer) clearTimeout(current.syncTimer);
+  clearAllTimers();
   safeCloseSocket(current.sock);
-  current = { status: 'idle', code: null, sock: null, error: null, syncTimer: null };
+  current = freshState();
   fs.rmSync(SESSION_PATH, { recursive: true, force: true });
   fs.mkdirSync(SESSION_PATH, { recursive: true });
 }
@@ -70,8 +102,7 @@ function clearSession() {
 function normalizePhone(input) {
   const raw = String(input || '').trim();
 
-  // Keep the old behavior compatible: final value must be 10-15 digits.
-  // This also allows users to paste formatted numbers; symbols are stripped.
+  // Phone number must be E.164 digits without + for Baileys pairing.
   if (!/^\+?[\d\s().-]{10,24}$/.test(raw)) return null;
 
   const digits = raw.replace(/\D/g, '');
@@ -91,18 +122,119 @@ function readCreds() {
   }
 }
 
-function hasBasicCreds() {
+function getSessionHealth() {
   const creds = readCreds();
-  return Boolean(creds?.registered && creds?.me?.id);
+  const processedHistoryMessages = Array.isArray(creds?.processedHistoryMessages)
+    ? creds.processedHistoryMessages.length
+    : 0;
+
+  const registered = Boolean(creds?.registered && creds?.me?.id);
+  const hasAppState = Boolean(creds?.myAppStateKeyId);
+
+  return {
+    hasCreds: Boolean(creds),
+    registered,
+    hasAppState,
+    fullySynced: registered && hasAppState,
+    accountSyncCounter: Number.isFinite(creds?.accountSyncCounter) ? creds.accountSyncCounter : null,
+    processedHistoryMessages,
+    platform: creds?.platform || null,
+  };
 }
 
-// ── PAIRING LOGIC ────────────────────────────────────────────────────────
-// This intentionally mirrors the original working Baileys flow closely.
-async function startPairing(phone) {
-  clearSession();
+function hasBasicCreds() {
+  return getSessionHealth().registered;
+}
+
+function hasFullySyncedCreds() {
+  return getSessionHealth().fullySynced;
+}
+
+function markReady(sessionId) {
+  if (current.sessionId !== sessionId) return;
+  clearAllTimers();
+  current.status = 'ready';
+  current.error = null;
+  current.detail = 'WhatsApp login finished. creds.json is ready.';
+  console.log('✅ Fully synced — creds ready for download');
+}
+
+function markSyncPending(sessionId, detail) {
+  if (current.sessionId !== sessionId || current.status === 'ready') return;
+  current.status = 'connected';
+  current.error = null;
+  current.detail = detail || 'WhatsApp accepted the code. Finishing login and app-state sync.';
+}
+
+function scheduleReconnect(sessionId, reason = 'connection closed') {
+  if (current.sessionId !== sessionId || current.status === 'ready') return;
+  if (current.reconnectTimer) return;
+
+  if (current.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    current.status = 'error';
+    current.error = 'WhatsApp accepted the code, but login did not finish. Tap Start Over, remove the stuck linked device if it appears, and generate a new code.';
+    current.detail = reason;
+    return;
+  }
+
+  current.reconnectAttempts += 1;
+  const delayMs = Math.min(12_000, 2_000 * current.reconnectAttempts);
+  markSyncPending(sessionId, `WhatsApp accepted the code. Reconnecting to finish login… Attempt ${current.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+
+  current.reconnectTimer = setTimeout(async () => {
+    if (current.sessionId !== sessionId || current.status === 'ready') return;
+    current.reconnectTimer = null;
+
+    try {
+      await createSocket({ sessionId, requestPairingCode: false });
+    } catch (error) {
+      console.error('Reconnect failed:', error);
+      scheduleReconnect(sessionId, error?.message || 'reconnect failed');
+    }
+  }, delayMs);
+}
+
+function startSlowSyncWarning(sessionId) {
+  clearTimer('syncTimer');
+  current.syncTimer = setTimeout(() => {
+    if (current.sessionId !== sessionId || current.status === 'ready') return;
+
+    const health = getSessionHealth();
+    if (health.registered && !health.fullySynced) {
+      current.status = 'connected';
+      current.error = null;
+      current.detail = 'The code was accepted, but WhatsApp is still finishing login. Keep this page open until it says ready.';
+      console.log('⏳ Login accepted but app-state sync is still pending');
+    }
+  }, SYNC_WARNING_MS);
+}
+
+function startHardLoginTimeout(sessionId) {
+  clearTimer('hardTimer');
+  current.hardTimer = setTimeout(() => {
+    if (current.sessionId !== sessionId || current.status === 'ready') return;
+
+    const health = getSessionHealth();
+    if (health.fullySynced) {
+      markReady(sessionId);
+      return;
+    }
+
+    current.status = 'error';
+    current.error = 'WhatsApp stayed on “Logging in” too long. Start over and generate a fresh code.';
+    current.detail = health.registered
+      ? 'The phone accepted the code, but Baileys did not receive full app-state sync.'
+      : 'The phone did not complete registration.';
+  }, LOGIN_TIMEOUT_MS);
+}
+
+async function createSocket({ sessionId, phone = null, requestPairingCode = false }) {
+  if (current.sessionId !== sessionId) throw new Error('Pairing session was reset.');
 
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
   const { version } = await fetchLatestBaileysVersion();
+
+  safeCloseSocket(current.sock);
 
   const sock = makeWASocket({
     auth: state,
@@ -114,77 +246,144 @@ async function startPairing(phone) {
 
   current.sock = sock;
 
+  let pairingCodeRequested = false;
+  let settleCode;
+  let rejectCode;
+  const codePromise = requestPairingCode
+    ? new Promise((resolve, reject) => {
+        settleCode = resolve;
+        rejectCode = reject;
+      })
+    : null;
+
+  const requestCodeOnce = async (source) => {
+    if (!requestPairingCode || pairingCodeRequested || current.sessionId !== sessionId) return;
+    if (state.creds?.registered) return;
+
+    pairingCodeRequested = true;
+    clearTimer('pairingCodeTimer');
+
+    try {
+      console.log(`📱 Requesting pairing code after ${source}`);
+      const code = await sock.requestPairingCode(phone);
+      if (current.sessionId !== sessionId) throw new Error('Pairing session was reset.');
+
+      current.code = code;
+      current.status = 'pairing';
+      current.error = null;
+      current.detail = 'Enter this code in WhatsApp > Linked Devices > Link with phone number.';
+      console.log('📱 Pairing code generated');
+      settleCode?.(code);
+    } catch (error) {
+      current.status = 'error';
+      current.error = error?.message || 'Could not request pairing code. Start over.';
+      rejectCode?.(error);
+    }
+  };
+
   sock.ev.on('creds.update', async () => {
+    if (current.sessionId !== sessionId) return;
+
     try {
       await saveCreds();
 
-      // Original behavior: myAppStateKeyId means app state sync completed.
-      const creds = readCreds();
-      if (creds?.myAppStateKeyId && current.status === 'connected') {
-        if (current.syncTimer) clearTimeout(current.syncTimer);
-        current.syncTimer = null;
-        current.status = 'ready';
-        current.error = null;
-        console.log('✅ Fully synced — creds ready for download');
+      if (hasFullySyncedCreds()) {
+        markReady(sessionId);
+        return;
+      }
+
+      if (hasBasicCreds()) {
+        markSyncPending(sessionId, 'WhatsApp accepted the code. Finishing login and app-state sync…');
       }
     } catch (error) {
       current.status = 'error';
       current.error = 'Could not save session credentials. Start over.';
+      current.detail = null;
       console.error('Could not save credentials:', error);
     }
   });
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
+  sock.ev.on('connection.update', async (update) => {
+    if (current.sessionId !== sessionId) return;
+
+    const { connection, lastDisconnect, qr } = update;
+
+    if (requestPairingCode && !pairingCodeRequested && (connection === 'connecting' || qr)) {
+      await requestCodeOnce(connection === 'connecting' ? 'connecting event' : 'qr event');
+    }
 
     if (connection === 'open') {
-      console.log('🔗 Connected — waiting for sync...');
-      current.status = 'connected';
+      console.log('🔗 Connected — waiting for full sync...');
+      current.status = hasFullySyncedCreds() ? 'ready' : 'connected';
       current.error = null;
+      current.detail = hasFullySyncedCreds()
+        ? 'WhatsApp login finished. creds.json is ready.'
+        : 'Connected. Waiting for WhatsApp app-state sync to finish…';
 
-      // Original behavior: if myAppStateKeyId never comes in, mark ready anyway.
-      current.syncTimer = setTimeout(() => {
-        if (current.status === 'connected') {
-          console.log('⚡ Sync timeout — marking ready with available creds');
-          current.status = 'ready';
-          current.error = null;
-        }
-      }, 20_000);
+      if (hasFullySyncedCreds()) {
+        markReady(sessionId);
+      } else {
+        startSlowSyncWarning(sessionId);
+        startHardLoginTimeout(sessionId);
+      }
     }
 
     if (connection === 'close') {
       if (current.status === 'ready') return;
 
-      // Original Render-specific behavior: Render can drop connection quickly,
-      // but creds may already be valid enough to download.
-      if (hasBasicCreds()) {
-        if (current.syncTimer) clearTimeout(current.syncTimer);
-        current.syncTimer = null;
-        current.status = 'ready';
-        current.error = null;
-        console.log('✅ Connection dropped but creds are valid — marking ready');
+      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+
+      if (statusCode === DisconnectReason.loggedOut) {
+        clearAllTimers();
+        current.status = 'error';
+        current.error = 'Logged out. Start over and generate a new code.';
+        current.detail = null;
         return;
       }
 
-      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      if (code === DisconnectReason.loggedOut) {
-        current.error = 'Logged out. Start over.';
-      } else {
-        current.error = 'Connection closed before sync. Start over.';
+      // Baileys docs say WhatsApp can force a disconnect after pairing; the
+      // socket is disposable, so create a fresh socket using saved auth state.
+      if (statusCode === DisconnectReason.restartRequired || hasBasicCreds()) {
+        scheduleReconnect(sessionId, `connection closed: ${statusCode || 'unknown'}`);
+        return;
       }
+
       current.status = 'error';
+      current.error = 'Connection closed before WhatsApp accepted the code. Start over.';
+      current.detail = `disconnect code: ${statusCode || 'unknown'}`;
+      rejectCode?.(new Error(current.error));
     }
   });
 
-  // Keep the original 2 second wait. Changing this can make pairing codes fail.
-  await new Promise((resolve) => setTimeout(resolve, 2000));
+  // Fallback for environments where the first connecting/QR event is missed.
+  if (requestPairingCode) {
+    current.pairingCodeTimer = setTimeout(() => {
+      requestCodeOnce('fallback timer').catch((error) => {
+        current.status = 'error';
+        current.error = error?.message || 'Could not request pairing code. Start over.';
+      });
+    }, 2_000);
 
-  const code = await sock.requestPairingCode(phone);
-  current.code = code;
-  current.status = 'pairing';
-  current.error = null;
-  console.log('📱 Pairing code generated');
-  return code;
+    return codePromise;
+  }
+
+  return null;
+}
+
+// ── PAIRING LOGIC ────────────────────────────────────────────────────────
+async function startPairing(phone) {
+  clearSession();
+  ensureSessionDirectory();
+
+  const sessionId = crypto.randomUUID();
+  current = {
+    ...freshState(),
+    sessionId,
+    status: 'starting',
+    detail: 'Starting WhatsApp pairing session…',
+  };
+
+  return createSocket({ sessionId, phone, requestPairingCode: true });
 }
 
 ensureSessionDirectory();
@@ -210,19 +409,34 @@ app.post('/pair', async (req, res) => {
   } catch (error) {
     current.status = 'error';
     current.error = error?.message || 'Could not generate pairing code. Start over.';
+    current.detail = null;
     console.error('Pairing failed:', error);
     return res.status(500).json({ error: current.error });
   }
 });
 
 app.get('/status', (_, res) => {
-  res.status(200).json({ status: current.status, error: current.error });
+  res.status(200).json({
+    status: current.status,
+    error: current.error,
+    detail: current.detail,
+    code: current.code,
+    canDownload: current.status === 'ready' && hasFullySyncedCreds(),
+    health: getSessionHealth(),
+  });
 });
 
 app.get('/download', (_, res) => {
   const credsPath = path.join(SESSION_PATH, 'creds.json');
   if (!fs.existsSync(credsPath)) {
     return res.status(404).json({ error: 'Not ready' });
+  }
+
+  if (!hasFullySyncedCreds()) {
+    return res.status(409).json({
+      error: 'Session is not fully synced yet. Keep the page open until it says ready.',
+      health: getSessionHealth(),
+    });
   }
 
   res.setHeader('Cache-Control', 'no-store');
