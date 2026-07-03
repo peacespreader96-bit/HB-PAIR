@@ -6,14 +6,15 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check public/app.js"
+    "check": "node --check server.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^6.7.22",
+    "archiver": "^7.0.1",
     "express": "^4.19.2",
     "helmet": "^8.0.0",
     "pino": "^9.4.0"
