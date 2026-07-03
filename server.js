@@ -53,6 +53,7 @@ let current = freshState();
 function freshState() {
   return {
     sessionId: null,
+    phone: null,
     status: 'idle',
     code: null,
     sock: null,
@@ -179,14 +180,28 @@ function scheduleReconnect(sessionId, reason = 'connection closed') {
 
   current.reconnectAttempts += 1;
   const delayMs = Math.min(12_000, 2_000 * current.reconnectAttempts);
-  markSyncPending(sessionId, `WhatsApp accepted the code. Reconnecting to finish login… Attempt ${current.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+
+  // If the code was never accepted, we need to request a brand-new one on reconnect.
+  const needsNewCode = !hasBasicCreds() && Boolean(current.phone);
+
+  if (needsNewCode) {
+    current.code = null;
+    current.status = 'starting';
+    current.detail = `Connection dropped. Getting a new pairing code… (attempt ${current.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`;
+  } else {
+    markSyncPending(sessionId, `WhatsApp accepted the code. Reconnecting to finish login… Attempt ${current.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+  }
 
   current.reconnectTimer = setTimeout(async () => {
     if (current.sessionId !== sessionId || current.status === 'ready') return;
     current.reconnectTimer = null;
 
+    // Recalculate in case creds arrived while we were waiting.
+    const reconnectNeedsCode = !hasBasicCreds() && Boolean(current.phone);
+
     try {
-      await createSocket({ sessionId, requestPairingCode: false });
+      clearTimer('pairingCodeTimer');
+      await createSocket({ sessionId, phone: current.phone, requestPairingCode: reconnectNeedsCode });
     } catch (error) {
       console.error('Reconnect failed:', error);
       scheduleReconnect(sessionId, error?.message || 'reconnect failed');
@@ -343,7 +358,13 @@ async function createSocket({ sessionId, phone = null, requestPairingCode = fals
 
       // Baileys docs say WhatsApp can force a disconnect after pairing; the
       // socket is disposable, so create a fresh socket using saved auth state.
-      if (statusCode === DisconnectReason.restartRequired || hasBasicCreds()) {
+      // connectionClosed (428) also fires when WhatsApp drops the socket while
+      // the user is still entering the pairing code — reconnect and get a new code.
+      if (
+        statusCode === DisconnectReason.restartRequired ||
+        statusCode === DisconnectReason.connectionClosed ||
+        hasBasicCreds()
+      ) {
         scheduleReconnect(sessionId, `connection closed: ${statusCode || 'unknown'}`);
         return;
       }
@@ -379,6 +400,7 @@ async function startPairing(phone) {
   current = {
     ...freshState(),
     sessionId,
+    phone,
     status: 'starting',
     detail: 'Starting WhatsApp pairing session…',
   };
