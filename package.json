@@ -1,0 +1,19 @@
+{
+  "name": "wa-pair",
+  "version": "1.0.0",
+  "description": "Standalone WhatsApp pairing server — Hannan Mariyam Bot",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.22",
+    "express": "^4.19.2",
+    "pino": "^9.4.0"
+  }
+}
