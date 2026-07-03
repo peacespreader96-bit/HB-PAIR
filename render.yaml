@@ -2,13 +2,9 @@ services:
   - type: web
     name: hannan-mariyam
     runtime: node
-    buildCommand: npm install
+    buildCommand: npm install --no-audit --no-fund
     startCommand: npm start
     healthCheckPath: /healthz
     envVars:
       - key: NODE_ENV
         value: production
-      - key: SESSION_TTL_MS
-        value: "600000"
-      - key: PAIRING_READY_TIMEOUT_MS
-        value: "35000"
