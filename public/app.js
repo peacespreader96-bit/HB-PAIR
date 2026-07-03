@@ -43,7 +43,7 @@ function setFormError(message = '') {
   formError.textContent = message;
 }
 
-function setStatus(type, message, spinning = false) {
+function setStatus(type, message, spinning = false, detail = '') {
   statusBox.className = `status ${type}`;
   statusBox.textContent = '';
 
@@ -58,6 +58,12 @@ function setStatus(type, message, spinning = false) {
   const text = document.createElement('span');
   text.textContent = message;
   statusBox.appendChild(text);
+
+  if (detail) {
+    const small = document.createElement('small');
+    small.textContent = detail;
+    statusBox.appendChild(small);
+  }
 }
 
 function stopPolling() {
@@ -70,7 +76,7 @@ function showCodeScreen(code) {
   step1.hidden = true;
   step2.hidden = false;
   downloadBtn.hidden = true;
-  setStatus('waiting', 'Waiting for you to enter the code…', true);
+  setStatus('waiting', 'Waiting for you to enter the code…', true, 'Keep this page open after entering the code.');
 }
 
 async function startPairing(event) {
@@ -114,32 +120,35 @@ function startPolling() {
   poll = setInterval(async () => {
     try {
       const response = await fetch('/status', { cache: 'no-store' });
-      const { status, error } = await readJsonResponse(response);
+      const { status, error, detail, canDownload, health } = await readJsonResponse(response);
 
       if (status === 'starting') {
-        setStatus('waiting', 'Starting secure pairing session…', true);
+        setStatus('waiting', 'Starting WhatsApp pairing session…', true, detail || '');
         return;
       }
 
       if (status === 'pairing') {
-        setStatus('waiting', 'Waiting for you to enter the code…', true);
+        setStatus('waiting', 'Waiting for you to enter the code…', true, detail || 'Keep this page open after entering the code.');
+        downloadBtn.hidden = true;
         return;
       }
 
       if (status === 'connected') {
-        setStatus('connected', 'Connected! Saving session files…', true);
+        const accepted = health?.registered ? 'Code accepted. Finishing WhatsApp login…' : 'Connected. Waiting for WhatsApp…';
+        setStatus('connected', accepted, true, detail || 'Do not refresh yet. This can take a little while on Render.');
+        downloadBtn.hidden = true;
         return;
       }
 
       if (status === 'ready') {
-        setStatus('ready', 'Fully synced! Your creds.json is ready.');
-        downloadBtn.hidden = false;
+        setStatus('ready', 'Fully synced! Your creds.json is ready.', false, detail || 'WhatsApp login is complete.');
+        downloadBtn.hidden = !canDownload;
         stopPolling();
         return;
       }
 
       if (status === 'error') {
-        setStatus('error', error || 'Something went wrong. Start over.');
+        setStatus('error', error || 'Something went wrong. Start over.', false, detail || '');
         downloadBtn.hidden = true;
         stopPolling();
       }
