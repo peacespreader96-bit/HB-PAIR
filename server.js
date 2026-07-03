@@ -7,8 +7,6 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import helmet from 'helmet';
-import archiver from 'archiver';
-import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -19,8 +17,6 @@ const __dirname = path.dirname(__filename);
 const SESSION_PATH = process.env.SESSION_PATH || path.join(__dirname, 'session');
 const PUBLIC_PATH = path.join(__dirname, 'public');
 const PORT = process.env.PORT || 3000;
-const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 10 * 60 * 1000);
-const PAIRING_READY_TIMEOUT_MS = Number(process.env.PAIRING_READY_TIMEOUT_MS || 35_000);
 
 const app = express();
 
@@ -30,21 +26,7 @@ app.use(express.json({ limit: '1kb' }));
 app.use(
   helmet({
     crossOriginEmbedderPolicy: false,
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        baseUri: ["'self'"],
-        connectSrc: ["'self'"],
-        fontSrc: ["'self'"],
-        formAction: ["'self'"],
-        frameAncestors: ["'none'"],
-        imgSrc: ["'self'", 'data:'],
-        objectSrc: ["'none'"],
-        scriptSrc: ["'self'"],
-        styleSrc: ["'self'"],
-        upgradeInsecureRequests: [],
-      },
-    },
+    contentSecurityPolicy: false,
   })
 );
 app.use((_, res, next) => {
@@ -61,27 +43,11 @@ app.use(
   })
 );
 
-function createIdleState() {
-  return {
-    id: null,
-    status: 'idle',
-    code: null,
-    sock: null,
-    error: null,
-    syncTimer: null,
-    cleanupTimer: null,
-    startedAt: null,
-  };
-}
-
-let current = createIdleState();
+// ── STATE ────────────────────────────────────────────────────────────────
+let current = { status: 'idle', code: null, sock: null, error: null, syncTimer: null };
 
 function ensureSessionDirectory() {
   fs.mkdirSync(SESSION_PATH, { recursive: true });
-}
-
-function clearTimer(timer) {
-  if (timer) clearTimeout(timer);
 }
 
 function safeCloseSocket(sock) {
@@ -93,7 +59,28 @@ function safeCloseSocket(sock) {
   }
 }
 
-function readSessionCreds() {
+function clearSession() {
+  if (current.syncTimer) clearTimeout(current.syncTimer);
+  safeCloseSocket(current.sock);
+  current = { status: 'idle', code: null, sock: null, error: null, syncTimer: null };
+  fs.rmSync(SESSION_PATH, { recursive: true, force: true });
+  fs.mkdirSync(SESSION_PATH, { recursive: true });
+}
+
+function normalizePhone(input) {
+  const raw = String(input || '').trim();
+
+  // Keep the old behavior compatible: final value must be 10-15 digits.
+  // This also allows users to paste formatted numbers; symbols are stripped.
+  if (!/^\+?[\d\s().-]{10,24}$/.test(raw)) return null;
+
+  const digits = raw.replace(/\D/g, '');
+  if (!/^\d{10,15}$/.test(digits)) return null;
+
+  return digits;
+}
+
+function readCreds() {
   const credsPath = path.join(SESSION_PATH, 'creds.json');
   if (!fs.existsSync(credsPath)) return null;
 
@@ -104,67 +91,15 @@ function readSessionCreds() {
   }
 }
 
-function hasUsableSession() {
-  const creds = readSessionCreds();
+function hasBasicCreds() {
+  const creds = readCreds();
   return Boolean(creds?.registered && creds?.me?.id);
 }
 
-function setReadyIfUsable(id, logMessage) {
-  if (current.id !== id || current.status === 'ready') return false;
-  if (!hasUsableSession()) return false;
-
-  clearTimer(current.syncTimer);
-  current.syncTimer = null;
-  current.status = 'ready';
-  current.error = null;
-  scheduleSessionCleanup(id);
-  console.log(logMessage);
-  return true;
-}
-
-function scheduleSessionCleanup(id) {
-  clearTimer(current.cleanupTimer);
-  current.cleanupTimer = setTimeout(() => {
-    if (current.id === id && current.status === 'ready') {
-      console.log('🧹 Session expired — cleaning up files');
-      resetSession().catch((error) => console.error('Session cleanup failed:', error));
-    }
-  }, SESSION_TTL_MS);
-}
-
-async function resetSession() {
-  clearTimer(current.syncTimer);
-  clearTimer(current.cleanupTimer);
-  safeCloseSocket(current.sock);
-
-  current = createIdleState();
-
-  await fs.promises.rm(SESSION_PATH, { recursive: true, force: true });
-  await fs.promises.mkdir(SESSION_PATH, { recursive: true });
-}
-
-function normalizePhone(input) {
-  const raw = String(input || '').trim();
-
-  // Allow common phone-number formatting while rejecting letters and symbols.
-  if (!/^\+?[\d\s().-]{10,24}$/.test(raw)) return null;
-
-  const digits = raw.replace(/\D/g, '');
-  if (!/^\d{10,15}$/.test(digits)) return null;
-
-  return digits;
-}
-
+// ── PAIRING LOGIC ────────────────────────────────────────────────────────
+// This intentionally mirrors the original working Baileys flow closely.
 async function startPairing(phone) {
-  await resetSession();
-
-  const id = crypto.randomUUID();
-  current = {
-    ...createIdleState(),
-    id,
-    status: 'starting',
-    startedAt: new Date().toISOString(),
-  };
+  clearSession();
 
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
   const { version } = await fetchLatestBaileysVersion();
@@ -175,93 +110,86 @@ async function startPairing(phone) {
     logger: pino({ level: process.env.LOG_LEVEL || 'silent' }),
     printQRInTerminal: false,
     syncFullHistory: false,
-    browser: ['Hannan Mariyam', 'Chrome', '1.0.0'],
   });
-
-  if (current.id !== id) {
-    safeCloseSocket(sock);
-    throw new Error('Pairing was reset. Please start again.');
-  }
 
   current.sock = sock;
 
   sock.ev.on('creds.update', async () => {
     try {
       await saveCreds();
-      setReadyIfUsable(id, '✅ Session is ready for download');
-    } catch (error) {
-      if (current.id === id) {
-        current.status = 'error';
-        current.error = 'Could not save session credentials. Start over.';
+
+      // Original behavior: myAppStateKeyId means app state sync completed.
+      const creds = readCreds();
+      if (creds?.myAppStateKeyId && current.status === 'connected') {
+        if (current.syncTimer) clearTimeout(current.syncTimer);
+        current.syncTimer = null;
+        current.status = 'ready';
+        current.error = null;
+        console.log('✅ Fully synced — creds ready for download');
       }
+    } catch (error) {
+      current.status = 'error';
+      current.error = 'Could not save session credentials. Start over.';
       console.error('Could not save credentials:', error);
     }
   });
 
   sock.ev.on('connection.update', (update) => {
-    if (current.id !== id) return;
-
     const { connection, lastDisconnect } = update;
 
     if (connection === 'open') {
+      console.log('🔗 Connected — waiting for sync...');
       current.status = 'connected';
       current.error = null;
-      console.log('🔗 Connected — checking session readiness');
 
-      if (setReadyIfUsable(id, '✅ Connected and session is ready')) return;
-
-      clearTimer(current.syncTimer);
+      // Original behavior: if myAppStateKeyId never comes in, mark ready anyway.
       current.syncTimer = setTimeout(() => {
-        if (current.id !== id || current.status === 'ready') return;
-
-        if (setReadyIfUsable(id, '✅ Session became usable after sync wait')) return;
-
-        current.status = 'error';
-        current.error = 'Connected, but the session was not fully saved. Keep WhatsApp open and start over.';
-      }, PAIRING_READY_TIMEOUT_MS);
+        if (current.status === 'connected') {
+          console.log('⚡ Sync timeout — marking ready with available creds');
+          current.status = 'ready';
+          current.error = null;
+        }
+      }, 20_000);
     }
 
     if (connection === 'close') {
       if (current.status === 'ready') return;
-      if (setReadyIfUsable(id, '✅ Connection closed after valid session was saved')) return;
 
-      clearTimer(current.syncTimer);
-      current.syncTimer = null;
+      // Original Render-specific behavior: Render can drop connection quickly,
+      // but creds may already be valid enough to download.
+      if (hasBasicCreds()) {
+        if (current.syncTimer) clearTimeout(current.syncTimer);
+        current.syncTimer = null;
+        current.status = 'ready';
+        current.error = null;
+        console.log('✅ Connection dropped but creds are valid — marking ready');
+        return;
+      }
 
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      if (code === DisconnectReason.loggedOut) {
+        current.error = 'Logged out. Start over.';
+      } else {
+        current.error = 'Connection closed before sync. Start over.';
+      }
       current.status = 'error';
-      current.error =
-        code === DisconnectReason.loggedOut
-          ? 'Logged out. Start over and generate a fresh code.'
-          : 'Connection closed before the session was ready. Start over.';
     }
   });
 
-  // Give the socket a brief moment to initialise before requesting the pairing code.
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-
-  if (current.id !== id) {
-    safeCloseSocket(sock);
-    throw new Error('Pairing was reset. Please start again.');
-  }
+  // Keep the original 2 second wait. Changing this can make pairing codes fail.
+  await new Promise((resolve) => setTimeout(resolve, 2000));
 
   const code = await sock.requestPairingCode(phone);
-
-  if (current.id !== id) {
-    safeCloseSocket(sock);
-    throw new Error('Pairing was reset. Please start again.');
-  }
-
   current.code = code;
   current.status = 'pairing';
   current.error = null;
   console.log('📱 Pairing code generated');
-
   return code;
 }
 
 ensureSessionDirectory();
 
+// ── ROUTES ───────────────────────────────────────────────────────────────
 app.get('/', (_, res) => {
   res.sendFile(path.join(PUBLIC_PATH, 'index.html'));
 });
@@ -274,60 +202,36 @@ app.post('/pair', async (req, res) => {
   try {
     const phone = normalizePhone(req.body?.phone);
     if (!phone) {
-      return res.status(400).json({ error: 'Enter a valid phone number with 10 to 15 digits.' });
+      return res.status(400).json({ error: 'Invalid number. Use country code, for example 919876543210.' });
     }
 
     const code = await startPairing(phone);
     return res.status(200).json({ code });
   } catch (error) {
     current.status = 'error';
-    current.error = 'Could not generate a pairing code. Start over and try again.';
+    current.error = error?.message || 'Could not generate pairing code. Start over.';
     console.error('Pairing failed:', error);
     return res.status(500).json({ error: current.error });
   }
 });
 
 app.get('/status', (_, res) => {
-  res.status(200).json({
-    status: current.status,
-    error: current.error,
-    ready: current.status === 'ready' && hasUsableSession(),
-  });
+  res.status(200).json({ status: current.status, error: current.error });
 });
 
-app.get('/download', (req, res) => {
-  if (current.status !== 'ready' || !hasUsableSession()) {
-    return res.status(409).json({ error: 'Session is not ready yet.' });
+app.get('/download', (_, res) => {
+  const credsPath = path.join(SESSION_PATH, 'creds.json');
+  if (!fs.existsSync(credsPath)) {
+    return res.status(404).json({ error: 'Not ready' });
   }
 
-  if (!fs.existsSync(SESSION_PATH)) {
-    return res.status(404).json({ error: 'Session folder not found.' });
-  }
-
-  const filename = 'hannan-mariyam-session.zip';
   res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-
-  const archive = archiver('zip', { zlib: { level: 9 } });
-
-  archive.on('error', (error) => {
-    console.error('Archive failed:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Could not create session download.' });
-    } else {
-      res.end();
-    }
-  });
-
-  archive.pipe(res);
-  archive.directory(SESSION_PATH, false);
-  archive.finalize();
+  res.download(credsPath, 'creds.json');
 });
 
-app.post('/reset', async (_, res) => {
+app.post('/reset', (_, res) => {
   try {
-    await resetSession();
+    clearSession();
     res.status(200).json({ ok: true });
   } catch (error) {
     console.error('Reset failed:', error);
@@ -344,6 +248,7 @@ app.use((error, _, res, __) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// ── START ────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log('');
   console.log('  ╔══════════════════════════════════════╗');
