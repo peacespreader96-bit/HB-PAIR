@@ -203,8 +203,17 @@ function scheduleReconnect(sessionId, reason = 'connection closed') {
       clearTimer('pairingCodeTimer');
       await createSocket({ sessionId, phone: current.phone, requestPairingCode: reconnectNeedsCode });
     } catch (error) {
-      console.error('Reconnect failed:', error);
-      scheduleReconnect(sessionId, error?.message || 'reconnect failed');
+      console.error('Reconnect failed:', error?.message);
+      if (reconnectNeedsCode) {
+        // New pairing code request failed — don't retry or we hammer WhatsApp
+        if (current.sessionId === sessionId && current.status !== 'ready') {
+          current.status = 'error';
+          current.error = 'WhatsApp is not accepting pairing requests right now. Wait a few minutes then tap Start Over.';
+          current.detail = error?.message || '';
+        }
+      } else {
+        scheduleReconnect(sessionId, error?.message || 'reconnect failed');
+      }
     }
   }, delayMs);
 }
@@ -290,8 +299,10 @@ async function createSocket({ sessionId, phone = null, requestPairingCode = fals
       console.log('📱 Pairing code generated');
       settleCode?.(code);
     } catch (error) {
+      const msg = error?.message || 'Could not request pairing code.';
       current.status = 'error';
-      current.error = error?.message || 'Could not request pairing code. Start over.';
+      current.error = `${msg} — WhatsApp may be rate-limiting this server. Wait a minute then tap Start Over.`;
+      console.error('Pairing code request failed:', msg);
       rejectCode?.(error);
     }
   };
@@ -323,11 +334,14 @@ async function createSocket({ sessionId, phone = null, requestPairingCode = fals
 
     const { connection, lastDisconnect, qr } = update;
 
-    if (requestPairingCode && !pairingCodeRequested && (connection === 'connecting' || qr)) {
-      await requestCodeOnce(connection === 'connecting' ? 'connecting event' : 'qr event');
-    }
-
     if (connection === 'open') {
+      // Request pairing code here — WS is confirmed open at this point.
+      // Requesting during 'connecting' fails because ws.isOpen is still false then.
+      if (requestPairingCode && !pairingCodeRequested) {
+        await requestCodeOnce('open event');
+      }
+      if (current.status === 'error') return; // requestPairingCode itself failed
+
       console.log('🔗 Connected — waiting for full sync...');
       current.status = hasFullySyncedCreds() ? 'ready' : 'connected';
       current.error = null;
@@ -345,6 +359,9 @@ async function createSocket({ sessionId, phone = null, requestPairingCode = fals
 
     if (connection === 'close') {
       if (current.status === 'ready') return;
+      // If requestPairingCode itself failed, status is already 'error'. Don't reconnect
+      // or we create an infinite loop: fail → close(428) → reconnect → fail → ...
+      if (current.status === 'error') return;
 
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
 
@@ -376,14 +393,14 @@ async function createSocket({ sessionId, phone = null, requestPairingCode = fals
     }
   });
 
-  // Fallback for environments where the first connecting/QR event is missed.
+  // Fallback: if 'open' event is delayed or missed, request after 5 seconds.
   if (requestPairingCode) {
     current.pairingCodeTimer = setTimeout(() => {
       requestCodeOnce('fallback timer').catch((error) => {
         current.status = 'error';
         current.error = error?.message || 'Could not request pairing code. Start over.';
       });
-    }, 2_000);
+    }, 5_000);
 
     return codePromise;
   }
