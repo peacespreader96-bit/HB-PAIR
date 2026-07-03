@@ -6,30 +6,165 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
+import helmet from 'helmet';
+import archiver from 'archiver';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const SESSION_PATH = path.join(__dirname, 'session');
+
+const SESSION_PATH = process.env.SESSION_PATH || path.join(__dirname, 'session');
+const PUBLIC_PATH = path.join(__dirname, 'public');
+const PORT = process.env.PORT || 3000;
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 10 * 60 * 1000);
+const PAIRING_READY_TIMEOUT_MS = Number(process.env.PAIRING_READY_TIMEOUT_MS || 35_000);
+
 const app = express();
-app.use(express.json());
 
-// ── STATE ────────────────────────────────────────────────────────────────
-let current = { status: 'idle', code: null, sock: null, error: null, syncTimer: null };
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '1kb' }));
+app.use(
+  helmet({
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+        imgSrc: ["'self'", 'data:'],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'"],
+        upgradeInsecureRequests: [],
+      },
+    },
+  })
+);
+app.use((_, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+app.use(
+  express.static(PUBLIC_PATH, {
+    etag: false,
+    maxAge: 0,
+    setHeaders(res) {
+      res.setHeader('Cache-Control', 'no-store');
+    },
+  })
+);
 
-function clearSession() {
-  if (current.syncTimer) clearTimeout(current.syncTimer);
-  if (current.sock) try { current.sock.end(); } catch {}
-  current = { status: 'idle', code: null, sock: null, error: null, syncTimer: null };
-  if (fs.existsSync(SESSION_PATH)) fs.rmSync(SESSION_PATH, { recursive: true });
+function createIdleState() {
+  return {
+    id: null,
+    status: 'idle',
+    code: null,
+    sock: null,
+    error: null,
+    syncTimer: null,
+    cleanupTimer: null,
+    startedAt: null,
+  };
+}
+
+let current = createIdleState();
+
+function ensureSessionDirectory() {
   fs.mkdirSync(SESSION_PATH, { recursive: true });
 }
 
-// ── PAIRING LOGIC ────────────────────────────────────────────────────────
+function clearTimer(timer) {
+  if (timer) clearTimeout(timer);
+}
+
+function safeCloseSocket(sock) {
+  if (!sock) return;
+  try {
+    sock.end?.();
+  } catch {
+    // Ignore socket shutdown errors while resetting state.
+  }
+}
+
+function readSessionCreds() {
+  const credsPath = path.join(SESSION_PATH, 'creds.json');
+  if (!fs.existsSync(credsPath)) return null;
+
+  try {
+    return JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function hasUsableSession() {
+  const creds = readSessionCreds();
+  return Boolean(creds?.registered && creds?.me?.id);
+}
+
+function setReadyIfUsable(id, logMessage) {
+  if (current.id !== id || current.status === 'ready') return false;
+  if (!hasUsableSession()) return false;
+
+  clearTimer(current.syncTimer);
+  current.syncTimer = null;
+  current.status = 'ready';
+  current.error = null;
+  scheduleSessionCleanup(id);
+  console.log(logMessage);
+  return true;
+}
+
+function scheduleSessionCleanup(id) {
+  clearTimer(current.cleanupTimer);
+  current.cleanupTimer = setTimeout(() => {
+    if (current.id === id && current.status === 'ready') {
+      console.log('🧹 Session expired — cleaning up files');
+      resetSession().catch((error) => console.error('Session cleanup failed:', error));
+    }
+  }, SESSION_TTL_MS);
+}
+
+async function resetSession() {
+  clearTimer(current.syncTimer);
+  clearTimer(current.cleanupTimer);
+  safeCloseSocket(current.sock);
+
+  current = createIdleState();
+
+  await fs.promises.rm(SESSION_PATH, { recursive: true, force: true });
+  await fs.promises.mkdir(SESSION_PATH, { recursive: true });
+}
+
+function normalizePhone(input) {
+  const raw = String(input || '').trim();
+
+  // Allow common phone-number formatting while rejecting letters and symbols.
+  if (!/^\+?[\d\s().-]{10,24}$/.test(raw)) return null;
+
+  const digits = raw.replace(/\D/g, '');
+  if (!/^\d{10,15}$/.test(digits)) return null;
+
+  return digits;
+}
+
 async function startPairing(phone) {
-  clearSession();
+  await resetSession();
+
+  const id = crypto.randomUUID();
+  current = {
+    ...createIdleState(),
+    id,
+    status: 'starting',
+    startedAt: new Date().toISOString(),
+  };
 
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
   const { version } = await fetchLatestBaileysVersion();
@@ -37,262 +172,183 @@ async function startPairing(phone) {
   const sock = makeWASocket({
     auth: state,
     version,
-    logger: pino({ level: 'silent' }),
+    logger: pino({ level: process.env.LOG_LEVEL || 'silent' }),
     printQRInTerminal: false,
     syncFullHistory: false,
+    browser: ['Hannan Mariyam', 'Chrome', '1.0.0'],
   });
+
+  if (current.id !== id) {
+    safeCloseSocket(sock);
+    throw new Error('Pairing was reset. Please start again.');
+  }
 
   current.sock = sock;
 
   sock.ev.on('creds.update', async () => {
-    await saveCreds();
-
-    // Check if fully synced (myAppStateKeyId present = sync complete)
     try {
-      const credsRaw = fs.readFileSync(path.join(SESSION_PATH, 'creds.json'), 'utf-8');
-      const creds = JSON.parse(credsRaw);
-      if (creds.myAppStateKeyId && current.status === 'connected') {
-        if (current.syncTimer) clearTimeout(current.syncTimer);
-        current.status = 'ready';
-        console.log('✅ Fully synced — creds ready for download');
+      await saveCreds();
+      setReadyIfUsable(id, '✅ Session is ready for download');
+    } catch (error) {
+      if (current.id === id) {
+        current.status = 'error';
+        current.error = 'Could not save session credentials. Start over.';
       }
-    } catch {}
+      console.error('Could not save credentials:', error);
+    }
   });
 
   sock.ev.on('connection.update', (update) => {
+    if (current.id !== id) return;
+
     const { connection, lastDisconnect } = update;
 
     if (connection === 'open') {
-      console.log('🔗 Connected — waiting for sync...');
       current.status = 'connected';
+      current.error = null;
+      console.log('🔗 Connected — checking session readiness');
 
-      // Fallback: if myAppStateKeyId never comes in 20s, mark ready anyway
+      if (setReadyIfUsable(id, '✅ Connected and session is ready')) return;
+
+      clearTimer(current.syncTimer);
       current.syncTimer = setTimeout(() => {
-        if (current.status === 'connected') {
-          console.log('⚡ Sync timeout — marking ready with available creds');
-          current.status = 'ready';
-        }
-      }, 20_000);
+        if (current.id !== id || current.status === 'ready') return;
+
+        if (setReadyIfUsable(id, '✅ Session became usable after sync wait')) return;
+
+        current.status = 'error';
+        current.error = 'Connected, but the session was not fully saved. Keep WhatsApp open and start over.';
+      }, PAIRING_READY_TIMEOUT_MS);
     }
 
     if (connection === 'close') {
       if (current.status === 'ready') return;
+      if (setReadyIfUsable(id, '✅ Connection closed after valid session was saved')) return;
 
-      // Key fix: Render drops connection fast but creds may already be saved.
-      // If registered + me exist, treat as ready even if connection dropped.
-      try {
-        const credsPath = path.join(SESSION_PATH, 'creds.json');
-        if (fs.existsSync(credsPath)) {
-          const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
-          if (creds.registered && creds.me?.id) {
-            if (current.syncTimer) clearTimeout(current.syncTimer);
-            current.status = 'ready';
-            console.log('✅ Connection dropped but creds are valid — marking ready');
-            return;
-          }
-        }
-      } catch {}
+      clearTimer(current.syncTimer);
+      current.syncTimer = null;
 
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      if (code === DisconnectReason.loggedOut) {
-        current.error = 'Logged out. Start over.';
-      } else {
-        current.error = 'Connection closed before sync. Start over.';
-      }
       current.status = 'error';
+      current.error =
+        code === DisconnectReason.loggedOut
+          ? 'Logged out. Start over and generate a fresh code.'
+          : 'Connection closed before the session was ready. Start over.';
     }
   });
 
-  // Small delay so socket initialises before requesting code
-  await new Promise(r => setTimeout(r, 2000));
+  // Give the socket a brief moment to initialise before requesting the pairing code.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  if (current.id !== id) {
+    safeCloseSocket(sock);
+    throw new Error('Pairing was reset. Please start again.');
+  }
+
   const code = await sock.requestPairingCode(phone);
+
+  if (current.id !== id) {
+    safeCloseSocket(sock);
+    throw new Error('Pairing was reset. Please start again.');
+  }
+
   current.code = code;
   current.status = 'pairing';
-  console.log(`📱 Pairing code for ${phone}: ${code}`);
+  current.error = null;
+  console.log('📱 Pairing code generated');
+
   return code;
 }
 
-// ── HTML ─────────────────────────────────────────────────────────────────
-const HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>WA Pair — Hannan Mariyam Bot</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#eee;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
-    .card{background:#141414;border:1px solid #222;border-radius:20px;padding:32px;width:100%;max-width:400px}
-    .logo{font-size:28px;margin-bottom:4px}
-    h1{font-size:18px;font-weight:700;color:#fff;margin-bottom:4px}
-    .sub{font-size:13px;color:#555;margin-bottom:28px}
-    label{font-size:12px;color:#666;font-weight:600;letter-spacing:.5px;text-transform:uppercase;display:block;margin-bottom:6px}
-    input{width:100%;padding:13px 16px;border-radius:10px;border:1px solid #2a2a2a;background:#1a1a1a;color:#eee;font-size:15px;outline:none;transition:.2s}
-    input:focus{border-color:#25D366}
-    input::placeholder{color:#444}
-    .btn{width:100%;padding:13px;border-radius:10px;border:none;background:#25D366;color:#000;font-size:15px;font-weight:700;cursor:pointer;margin-top:12px;transition:.2s}
-    .btn:hover{background:#20bd5a}
-    .btn:disabled{background:#1e1e1e;color:#444;cursor:not-allowed}
-    .btn.blue{background:#1a73e8;color:#fff}
-    .btn.blue:hover{background:#1557b0}
-    .btn.ghost{background:#1e1e1e;color:#aaa}
-    .btn.ghost:hover{background:#252525}
-    .code-box{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;padding:24px;text-align:center;margin:20px 0}
-    .code{font-size:38px;font-weight:800;letter-spacing:10px;color:#25D366;font-family:'Courier New',monospace}
-    .code-hint{font-size:12px;color:#555;margin-top:8px}
-    .steps{background:#111;border-radius:10px;padding:16px;margin:16px 0;font-size:13px;color:#666;line-height:2}
-    .steps b{color:#aaa}
-    .status{text-align:center;font-size:13px;padding:10px;border-radius:8px;margin:12px 0}
-    .status.waiting{background:#1a1a00;color:#888}
-    .status.connected{background:#0a1f0e;color:#25D366}
-    .status.ready{background:#0a1f0e;color:#25D366;font-weight:700}
-    .status.error{background:#1f0a0a;color:#ff5555}
-    .spinner{display:inline-block;animation:spin 1s linear infinite}
-    @keyframes spin{to{transform:rotate(360deg)}}
-    .hidden{display:none}
-  </style>
-</head>
-<body>
-<div class="card">
-  <div class="logo">🤍</div>
-  <h1>Hannan Mariyam Bot</h1>
-  <p class="sub">Made with love by Afroz Khan — Self-hosted pairing</p>
+ensureSessionDirectory();
 
-  <!-- Step 1: Phone input -->
-  <div id="step1">
-    <label>WhatsApp Number</label>
-    <input id="phone" type="tel" placeholder="919876543210 (no + or spaces)"/>
-    <button class="btn" onclick="startPair()">Generate Pairing Code</button>
-  </div>
+app.get('/', (_, res) => {
+  res.sendFile(path.join(PUBLIC_PATH, 'index.html'));
+});
 
-  <!-- Step 2: Code + status -->
-  <div id="step2" class="hidden">
-    <div class="code-box">
-      <div class="code" id="codeText">– – – –</div>
-      <div class="code-hint">Enter this code in WhatsApp</div>
-    </div>
-
-    <div class="steps">
-      1. Open <b>WhatsApp</b><br>
-      2. Go to <b>Linked Devices</b><br>
-      3. Tap <b>Link a Device</b><br>
-      4. Tap <b>Link with Phone Number</b><br>
-      5. Enter the code above
-    </div>
-
-    <div class="status waiting" id="statusBox">
-      <span class="spinner">⏳</span> Waiting for you to enter the code…
-    </div>
-
-    <button class="btn blue hidden" id="downloadBtn" onclick="downloadCreds()">⬇️ Download creds.json</button>
-    <button class="btn ghost" style="margin-top:8px" onclick="reset()">🔄 Start Over</button>
-  </div>
-</div>
-
-<script>
-  let poll = null;
-
-  async function startPair() {
-    const phone = document.getElementById('phone').value.replace(/\\s+/g,'');
-    if (!/^\\d{10,15}$/.test(phone)) { alert('Enter a valid number e.g. 919876543210'); return; }
-
-    const btn = document.querySelector('#step1 .btn');
-    btn.disabled = true;
-    btn.textContent = 'Generating…';
-
-    try {
-      const res = await fetch('/pair', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({phone}) });
-      const data = await res.json();
-      if (!data.code) throw new Error(data.error || 'Failed');
-
-      document.getElementById('codeText').textContent = data.code;
-      document.getElementById('step1').classList.add('hidden');
-      document.getElementById('step2').classList.remove('hidden');
-      startPolling();
-    } catch(e) {
-      alert('Error: ' + e.message);
-      btn.disabled = false;
-      btn.textContent = 'Generate Pairing Code';
-    }
-  }
-
-  function startPolling() {
-    poll = setInterval(async () => {
-      try {
-        const res = await fetch('/status');
-        const { status, error } = await res.json();
-        const box = document.getElementById('statusBox');
-        const dlBtn = document.getElementById('downloadBtn');
-
-        if (status === 'pairing') {
-          box.className = 'status waiting';
-          box.innerHTML = '<span class="spinner">⏳</span> Waiting for you to enter the code…';
-        } else if (status === 'connected') {
-          box.className = 'status connected';
-          box.innerHTML = '<span class="spinner">🔄</span> Connected! Syncing account…';
-        } else if (status === 'ready') {
-          box.className = 'status ready';
-          box.innerHTML = '✅ Fully synced! Your creds.json is ready.';
-          dlBtn.classList.remove('hidden');
-          clearInterval(poll);
-        } else if (status === 'error') {
-          box.className = 'status error';
-          box.innerHTML = '❌ ' + (error || 'Something went wrong. Start over.');
-          clearInterval(poll);
-        }
-      } catch {}
-    }, 2000);
-  }
-
-  function downloadCreds() { window.location.href = '/download'; }
-
-  async function reset() {
-    clearInterval(poll);
-    await fetch('/reset', { method:'POST' });
-    location.reload();
-  }
-</script>
-</body>
-</html>`;
-
-// ── ROUTES ───────────────────────────────────────────────────────────────
-app.get('/', (_, res) => res.send(HTML));
+app.get('/healthz', (_, res) => {
+  res.status(200).json({ ok: true, status: current.status });
+});
 
 app.post('/pair', async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone || !/^\d{10,15}$/.test(phone)) return res.json({ error: 'Invalid number' });
+    const phone = normalizePhone(req.body?.phone);
+    if (!phone) {
+      return res.status(400).json({ error: 'Enter a valid phone number with 10 to 15 digits.' });
+    }
+
     const code = await startPairing(phone);
-    res.json({ code });
-  } catch (err) {
+    return res.status(200).json({ code });
+  } catch (error) {
     current.status = 'error';
-    current.error = err.message;
-    res.json({ error: err.message });
+    current.error = 'Could not generate a pairing code. Start over and try again.';
+    console.error('Pairing failed:', error);
+    return res.status(500).json({ error: current.error });
   }
 });
 
 app.get('/status', (_, res) => {
-  res.json({ status: current.status, error: current.error });
+  res.status(200).json({
+    status: current.status,
+    error: current.error,
+    ready: current.status === 'ready' && hasUsableSession(),
+  });
 });
 
-app.get('/download', (_, res) => {
-  const credsPath = path.join(SESSION_PATH, 'creds.json');
-  if (!fs.existsSync(credsPath)) return res.status(404).json({ error: 'Not ready' });
-  res.download(credsPath, 'creds.json');
+app.get('/download', (req, res) => {
+  if (current.status !== 'ready' || !hasUsableSession()) {
+    return res.status(409).json({ error: 'Session is not ready yet.' });
+  }
+
+  if (!fs.existsSync(SESSION_PATH)) {
+    return res.status(404).json({ error: 'Session folder not found.' });
+  }
+
+  const filename = 'hannan-mariyam-session.zip';
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+  const archive = archiver('zip', { zlib: { level: 9 } });
+
+  archive.on('error', (error) => {
+    console.error('Archive failed:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Could not create session download.' });
+    } else {
+      res.end();
+    }
+  });
+
+  archive.pipe(res);
+  archive.directory(SESSION_PATH, false);
+  archive.finalize();
 });
 
-app.post('/reset', (_, res) => {
-  clearSession();
-  res.json({ ok: true });
+app.post('/reset', async (_, res) => {
+  try {
+    await resetSession();
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    console.error('Reset failed:', error);
+    res.status(500).json({ error: 'Could not reset session.' });
+  }
 });
 
-// ── START ────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
+app.use((_, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+app.use((error, _, res, __) => {
+  console.error('Unhandled server error:', error);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
 app.listen(PORT, () => {
   console.log('');
   console.log('  ╔══════════════════════════════════════╗');
-  console.log('  ║       Hannan Mariyam Bot Pair        ║');
-  console.log('  ║   Made with love by Afroz Khan  🤍   ║');
+  console.log('  ║            Hannan Mariyam            ║');
+  console.log('  ║     Made In Love By Afroz Khan  🤍   ║');
   console.log('  ╚══════════════════════════════════════╝');
   console.log('');
   console.log(`  🌐 Open: http://localhost:${PORT}`);
