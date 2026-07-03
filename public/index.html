@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#fff7fb" />
+  <title>Hannan Mariyam</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="page-shell" aria-labelledby="siteTitle">
+    <section class="card" aria-label="WhatsApp pairing form">
+      <div class="brand-mark" aria-hidden="true">🤍</div>
+
+      <header class="hero">
+        <p class="eyebrow">Romantic pairing portal</p>
+        <h1 id="siteTitle">Hannan Mariyam</h1>
+        <p class="subtitle">Made In Love By Afroz Khan</p>
+      </header>
+
+      <section id="step1" class="panel">
+        <form id="pairForm" novalidate>
+          <label for="phone">WhatsApp Number</label>
+          <div class="input-wrap">
+            <span aria-hidden="true">+</span>
+            <input
+              id="phone"
+              name="phone"
+              type="tel"
+              inputmode="numeric"
+              autocomplete="tel"
+              maxlength="24"
+              placeholder="919876543210"
+              aria-describedby="phoneHelp formError"
+              required
+            />
+          </div>
+          <p id="phoneHelp" class="help-text">Use country code, no OTP needed here. Spaces and hyphens are okay.</p>
+          <p id="formError" class="form-error" role="alert" aria-live="polite"></p>
+          <button id="generateBtn" class="btn primary" type="submit">Generate Pairing Code</button>
+        </form>
+      </section>
+
+      <section id="step2" class="panel" hidden>
+        <div class="code-box" aria-live="polite">
+          <p class="code-label">Your pairing code</p>
+          <p class="code" id="codeText">••••••••</p>
+          <p class="code-hint">Enter this code inside WhatsApp</p>
+        </div>
+
+        <ol class="steps" aria-label="Pairing steps">
+          <li>Open <strong>WhatsApp</strong></li>
+          <li>Go to <strong>Linked Devices</strong></li>
+          <li>Tap <strong>Link a Device</strong></li>
+          <li>Choose <strong>Link with Phone Number</strong></li>
+          <li>Enter the code shown above</li>
+        </ol>
+
+        <div class="status waiting" id="statusBox" role="status" aria-live="polite">
+          <span class="spinner" aria-hidden="true">⏳</span>
+          <span>Waiting for you to enter the code…</span>
+        </div>
+
+        <button class="btn primary" id="downloadBtn" type="button" hidden>Download Session ZIP</button>
+        <button class="btn ghost" id="resetBtn" type="button">Start Over</button>
+      </section>
+    </section>
+  </main>
+</body>
+</html>
