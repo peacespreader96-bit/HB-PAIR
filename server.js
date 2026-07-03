@@ -76,12 +76,30 @@ async function startPairing(phone) {
     }
 
     if (connection === 'close') {
+      if (current.status === 'ready') return;
+
+      // Key fix: Render drops connection fast but creds may already be saved.
+      // If registered + me exist, treat as ready even if connection dropped.
+      try {
+        const credsPath = path.join(SESSION_PATH, 'creds.json');
+        if (fs.existsSync(credsPath)) {
+          const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+          if (creds.registered && creds.me?.id) {
+            if (current.syncTimer) clearTimeout(current.syncTimer);
+            current.status = 'ready';
+            console.log('✅ Connection dropped but creds are valid — marking ready');
+            return;
+          }
+        }
+      } catch {}
+
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      if (code === DisconnectReason.loggedOut || current.status === 'ready') return;
-      if (current.status !== 'ready') {
-        current.error = 'Connection closed. Try again.';
-        current.status = 'error';
+      if (code === DisconnectReason.loggedOut) {
+        current.error = 'Logged out. Start over.';
+      } else {
+        current.error = 'Connection closed before sync. Start over.';
       }
+      current.status = 'error';
     }
   });
 
