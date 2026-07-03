@@ -120,14 +120,22 @@ function startPolling() {
   poll = setInterval(async () => {
     try {
       const response = await fetch('/status', { cache: 'no-store' });
-      const { status, error, detail, canDownload, health } = await readJsonResponse(response);
+      const { status, error, detail, code: freshCode, canDownload, health } = await readJsonResponse(response);
 
       if (status === 'starting') {
-        setStatus('waiting', 'Starting WhatsApp pairing session…', true, detail || '');
+        const msg = step2.hidden
+          ? 'Starting WhatsApp pairing session…'
+          : 'Connection dropped. Getting a new code, please wait…';
+        setStatus('waiting', msg, true, detail || '');
         return;
       }
 
       if (status === 'pairing') {
+        // Update the displayed code whenever a fresh one arrives (e.g. after a 428 reconnect).
+        if (freshCode && codeText.textContent !== freshCode) {
+          codeText.textContent = freshCode;
+          if (step2.hidden) showCodeScreen(freshCode);
+        }
         setStatus('waiting', 'Waiting for you to enter the code…', true, detail || 'Keep this page open after entering the code.');
         downloadBtn.hidden = true;
         return;
